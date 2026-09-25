@@ -16,7 +16,7 @@ Press Ctrl+C to stop sharing.
 """
 
 import http.server
-import socketserver
+import socket
 import os
 import sys
 import argparse
