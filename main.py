@@ -17,15 +17,34 @@ Press Ctrl+C to stop sharing.
 
 import http.server
 import socketserver
-import socket
 import os
 import sys
 import argparse
 import html
 import shutil
 import urllib.parse
+import uuid
+import time
+import json
+import re
+import threading
 
 DEFAULT_PORT = 8000
+ONLINE_WINDOW = 15  # seconds since last poll before a device is considered "offline"
+
+DEVICES = {}          # device_id -> {"name", "ip", "last_seen"}
+DEVICES_LOCK = threading.Lock()
+
+
+def touch_device(device_id, ip):
+    """Register a device or update its last-seen time / IP."""
+    with DEVICES_LOCK:
+        d = DEVICES.get(device_id)
+        if d is None:
+            DEVICES[device_id] = {"name": f"Device …{ip.split('.')[-1]}", "ip": ip, "last_seen": time.time()}
+        else:
+            d["ip"] = ip
+            d["last_seen"] = time.time()
 
 
 def get_local_ip():
@@ -74,10 +93,12 @@ def unique_path(directory, filename):
 def parse_multipart(rfile, content_type, content_length):
     """
     Minimal multipart/form-data parser (avoids the deprecated cgi module).
-    Returns (raw_bytes, filename) for the first file field found, or (None, None).
+    Returns (file_bytes, filename, fields) for the first file field found
+    plus a dict of any other (non-file) text fields, e.g. {"target": "..."}.
     """
+    fields = {}
     if "boundary=" not in content_type:
-        return None, None
+        return None, None, fields
     boundary = content_type.split("boundary=", 1)[1].strip()
     if boundary.startswith('"') and boundary.endswith('"'):
         boundary = boundary[1:-1]
@@ -85,6 +106,8 @@ def parse_multipart(rfile, content_type, content_length):
 
     body = rfile.read(content_length)
     parts = body.split(boundary_bytes)
+
+    file_data, filename = None, None
 
     for part in parts:
         part = part.strip(b"\r\n")
@@ -94,7 +117,7 @@ def parse_multipart(rfile, content_type, content_length):
             continue
         headers_raw, data = part.split(b"\r\n\r\n", 1)
         headers_text = headers_raw.decode(errors="replace")
-        if "filename=" not in headers_text:
+        if "Content-Disposition" not in headers_text:
             continue
         try:
             disp_line = next(
@@ -102,18 +125,25 @@ def parse_multipart(rfile, content_type, content_length):
             )
         except StopIteration:
             continue
-        filename = None
+
+        name, part_filename = None, None
         for chunk in disp_line.split(";"):
             chunk = chunk.strip()
-            if chunk.startswith("filename="):
-                filename = chunk[len("filename="):].strip('"')
-        if not filename:
-            continue
+            if chunk.startswith("name="):
+                name = chunk[len("name="):].strip('"')
+            elif chunk.startswith("filename="):
+                part_filename = chunk[len("filename="):].strip('"')
+
         if data.endswith(b"\r\n"):
             data = data[:-2]
-        return data, os.path.basename(filename)
 
-    return None, None
+        if part_filename:
+            if file_data is None:  # only keep the first file field
+                file_data, filename = data, os.path.basename(part_filename)
+        elif name:
+            fields[name] = data.decode(errors="replace")
+
+    return file_data, filename, fields
 
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -187,6 +217,38 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .size {{ color: var(--muted); font-size: 0.8rem; white-space: nowrap; margin-left: 12px; }}
   .empty {{ color: var(--muted); font-style: italic; padding: 8px 4px; }}
   #status {{ margin-top: 10px; font-size: 0.85rem; color: var(--muted); }}
+  .device-row {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.9rem;
+  }}
+  .device-row:last-child {{ border-bottom: none; }}
+  .device-row .dot {{
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #3ddc84; flex-shrink: 0;
+  }}
+  .device-row .name {{ flex: 1; }}
+  .device-row .ip {{ color: var(--muted); font-size: 0.78rem; }}
+  .device-row .rename {{
+    background: none; border: none; color: var(--muted);
+    cursor: pointer; font-size: 0.85rem;
+  }}
+  #inboxBanner {{ margin-bottom: 16px; }}
+  .inbox-item {{
+    background: rgba(61,220,132,0.1);
+    border: 1px solid #3ddc84;
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin-bottom: 8px;
+    font-size: 0.9rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }}
+  .inbox-item a {{ color: #3ddc84; font-weight: 600; text-decoration: none; }}
 </style>
 </head>
 <body>
@@ -194,12 +256,25 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <h1>&#128193; File Share</h1>
   <div class="subtitle">Anyone on this WiFi network can view this page.</div>
 
+  <div id="inboxBanner"></div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Devices on this share</h3>
+    <div id="deviceList"><div class="empty">Looking for devices...</div></div>
+  </div>
+
   <div class="card">
     <form id="uploadForm" enctype="multipart/form-data" method="post">
       <div id="dropzone">
         <div>Drag &amp; drop a file here, or</div>
         <label class="btn" for="fileInput">Choose File</label>
         <input id="fileInput" type="file" name="file">
+      </div>
+      <div style="margin-top:12px; font-size:0.85rem; color:var(--muted);">
+        Send to:
+        <select id="targetSelect" style="margin-left:6px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:4px 8px;">
+          <option value="__all__">Everyone (shared folder)</option>
+        </select>
       </div>
       <div id="status"></div>
     </form>
@@ -216,14 +291,69 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   const fileInput = document.getElementById('fileInput');
   const status = document.getElementById('status');
 
+  const targetSelect = document.getElementById('targetSelect');
+
   function uploadFile(file) {{
     const data = new FormData();
     data.append('file', file);
-    status.textContent = 'Uploading ' + file.name + '...';
+    data.append('target', targetSelect.value);
+    const label = targetSelect.options[targetSelect.selectedIndex].text;
+    status.textContent = 'Sending ' + file.name + ' to ' + label + '...';
     fetch('/', {{ method: 'POST', body: data }})
       .then(() => window.location.reload())
       .catch(() => {{ status.textContent = 'Upload failed. Try again.'; }});
   }}
+
+  // --- Live device list ---
+  function refreshDevices() {{
+    fetch('/devices').then(r => r.json()).then(devices => {{
+      const list = document.getElementById('deviceList');
+      if (!devices.length) {{
+        list.innerHTML = '<div class="empty">No other devices have opened this page yet.</div>';
+      }} else {{
+        list.innerHTML = devices.map(d => `
+          <div class="device-row">
+            <span class="dot"></span>
+            <span class="name">${{d.name}}${{d.self ? ' (you)' : ''}}</span>
+            <span class="ip">${{d.ip}}</span>
+            ${{d.self ? '<button class="rename" data-rename>rename</button>' : ''}}
+          </div>`).join('');
+        const renameBtn = list.querySelector('[data-rename]');
+        if (renameBtn) renameBtn.addEventListener('click', renameSelf);
+      }}
+      const prev = targetSelect.value;
+      targetSelect.innerHTML = '<option value="__all__">Everyone (shared folder)</option>' +
+        devices.filter(d => !d.self).map(d => `<option value="${{d.id}}">${{d.name}}</option>`).join('');
+      if ([...targetSelect.options].some(o => o.value === prev)) targetSelect.value = prev;
+    }}).catch(() => {{}});
+  }}
+
+  function renameSelf() {{
+    const name = prompt('Name this device:');
+    if (!name) return;
+    fetch('/rename', {{ method: 'POST', body: JSON.stringify({{ name }}) }}).then(refreshDevices);
+  }}
+
+  // --- Inbox: files sent directly to this device ---
+  const seenInbox = new Set();
+  function refreshInbox() {{
+    fetch('/inbox-status').then(r => r.json()).then(items => {{
+      const banner = document.getElementById('inboxBanner');
+      banner.innerHTML = items.map(it => `
+        <div class="inbox-item">
+          <span>&#128229; Received <strong>${{it.name}}</strong> (${{it.size}})</span>
+          <a href="${{it.url}}" download>Download</a>
+        </div>`).join('');
+      if (items.some(it => !seenInbox.has(it.name))) {{
+        items.forEach(it => seenInbox.add(it.name));
+      }}
+    }}).catch(() => {{}});
+  }}
+
+  refreshDevices();
+  refreshInbox();
+  setInterval(refreshDevices, 4000);
+  setInterval(refreshInbox, 4000);
 
   fileInput.addEventListener('change', () => {{
     if (fileInput.files.length) uploadFile(fileInput.files[0]);
@@ -260,13 +390,34 @@ class ShareHandler(http.server.SimpleHTTPRequestHandler):
         # Bigger chunks than the 16KB default reduce syscall overhead on large files.
         shutil.copyfileobj(source, outputfile, length=1024 * 1024)
 
+    def get_device_id(self):
+        """Read the device_id cookie, or mint a fresh one. Returns (id, is_new)."""
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            part = part.strip()
+            if part.startswith("device_id="):
+                candidate = part[len("device_id="):]
+                if re.fullmatch(r"[0-9a-f]{32}", candidate):
+                    return candidate, False
+        return uuid.uuid4().hex, True
+
     def do_GET(self):
+        device_id, is_new = self.get_device_id()
+        touch_device(device_id, self.client_address[0])
+
         if self.path == "/":
-            self.send_upload_form()
+            self.send_upload_form(device_id, is_new)
+        elif self.path == "/devices":
+            self.send_devices_json(device_id, is_new)
+        elif self.path == "/inbox-status":
+            self.send_inbox_status(device_id, is_new)
         else:
             super().do_GET()
 
-    def send_upload_form(self):
+    def set_device_cookie(self, device_id):
+        self.send_header("Set-Cookie", f"device_id={device_id}; Path=/; Max-Age=86400")
+
+    def send_upload_form(self, device_id, is_new):
         entries = []
         for f in sorted(os.listdir(self.directory)):
             full = os.path.join(self.directory, f)
@@ -285,10 +436,54 @@ class ShareHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
+        if is_new:
+            self.set_device_cookie(device_id)
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_json(self, obj, device_id, is_new):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if is_new:
+            self.set_device_cookie(device_id)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_devices_json(self, self_id, is_new):
+        now = time.time()
+        with DEVICES_LOCK:
+            online = [
+                {"id": did, "name": d["name"], "ip": d["ip"], "self": did == self_id}
+                for did, d in DEVICES.items()
+                if now - d["last_seen"] <= ONLINE_WINDOW
+            ]
+        online.sort(key=lambda d: (not d["self"], d["name"]))
+        self._send_json(online, self_id, is_new)
+
+    def send_inbox_status(self, device_id, is_new):
+        inbox_dir = os.path.join(self.directory, ".inbox", device_id)
+        items = []
+        if os.path.isdir(inbox_dir):
+            for f in sorted(os.listdir(inbox_dir)):
+                full = os.path.join(inbox_dir, f)
+                if os.path.isfile(full):
+                    items.append({
+                        "name": f,
+                        "url": f"/.inbox/{device_id}/{urllib.parse.quote(f)}",
+                        "size": human_size(os.path.getsize(full)),
+                    })
+        self._send_json(items, device_id, is_new)
+
     def do_POST(self):
+        device_id, is_new = self.get_device_id()
+        touch_device(device_id, self.client_address[0])
+
+        if self.path == "/rename":
+            self.handle_rename(device_id, is_new)
+            return
+
         content_type = self.headers.get("Content-Type", "")
         content_length = int(self.headers.get("Content-Length", 0))
 
@@ -297,18 +492,47 @@ class ShareHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             return
 
-        data, filename = parse_multipart(self.rfile, content_type, content_length)
+        data, filename, fields = parse_multipart(self.rfile, content_type, content_length)
+        target = fields.get("target", "").strip()
 
         if data is not None and filename and is_safe_filename(filename):
-            filepath = unique_path(self.directory, filename)
-            with open(filepath, "wb") as f:
-                f.write(data)
-            print(f"  Received file: {os.path.basename(filepath)} ({human_size(len(data))})")
+            if target and target != "__all__":
+                # Direct send: goes only into that device's private inbox.
+                inbox_dir = os.path.join(self.directory, ".inbox", target)
+                os.makedirs(inbox_dir, exist_ok=True)
+                filepath = unique_path(inbox_dir, filename)
+                with open(filepath, "wb") as f:
+                    f.write(data)
+                print(f"  Sent '{os.path.basename(filepath)}' directly to device {target[:8]} ({human_size(len(data))})")
+            else:
+                filepath = unique_path(self.directory, filename)
+                with open(filepath, "wb") as f:
+                    f.write(data)
+                print(f"  Received file: {os.path.basename(filepath)} ({human_size(len(data))})")
         elif filename:
             print(f"  Rejected unsafe filename: {filename!r}")
 
         self.send_response(303)
         self.send_header("Location", "/")
+        if is_new:
+            self.set_device_cookie(device_id)
+        self.end_headers()
+
+    def handle_rename(self, device_id, is_new):
+        content_length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(content_length) if content_length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            new_name = str(payload.get("name", "")).strip()[:40]
+        except Exception:
+            new_name = ""
+        if new_name:
+            with DEVICES_LOCK:
+                if device_id in DEVICES:
+                    DEVICES[device_id]["name"] = html.escape(new_name)
+        self.send_response(204)
+        if is_new:
+            self.set_device_cookie(device_id)
         self.end_headers()
 
 
