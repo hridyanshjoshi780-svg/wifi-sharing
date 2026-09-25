@@ -22,6 +22,7 @@ import os
 import sys
 import argparse
 import html
+import shutil
 import urllib.parse
 
 DEFAULT_PORT = 8000
@@ -57,6 +58,17 @@ def is_safe_filename(name):
     if "/" in name or "\\" in name or "\x00" in name:
         return False
     return True
+
+
+def unique_path(directory, filename):
+    """If filename already exists in directory, append ' (1)', ' (2)', etc. until it doesn't."""
+    base, ext = os.path.splitext(filename)
+    candidate = filename
+    counter = 1
+    while os.path.exists(os.path.join(directory, candidate)):
+        candidate = f"{base} ({counter}){ext}"
+        counter += 1
+    return os.path.join(directory, candidate)
 
 
 def parse_multipart(rfile, content_type, content_length):
@@ -244,6 +256,10 @@ class ShareHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"  {self.address_string()} -> {fmt % args}")
 
+    def copyfile(self, source, outputfile):
+        # Bigger chunks than the 16KB default reduce syscall overhead on large files.
+        shutil.copyfileobj(source, outputfile, length=1024 * 1024)
+
     def do_GET(self):
         if self.path == "/":
             self.send_upload_form()
@@ -284,10 +300,10 @@ class ShareHandler(http.server.SimpleHTTPRequestHandler):
         data, filename = parse_multipart(self.rfile, content_type, content_length)
 
         if data is not None and filename and is_safe_filename(filename):
-            filepath = os.path.join(self.directory, filename)
+            filepath = unique_path(self.directory, filename)
             with open(filepath, "wb") as f:
                 f.write(data)
-            print(f"  Received file: {filename} ({human_size(len(data))})")
+            print(f"  Received file: {os.path.basename(filepath)} ({human_size(len(data))})")
         elif filename:
             print(f"  Rejected unsafe filename: {filename!r}")
 
@@ -317,7 +333,7 @@ def main():
     handler = make_handler(directory)
 
     try:
-        with socketserver.TCPServer(("0.0.0.0", args.port), handler) as httpd:
+        with http.server.ThreadingHTTPServer(("0.0.0.0", args.port), handler) as httpd:
             print("=" * 50)
             print(" File sharing is running!")
             print(f" Sharing folder: {directory}")
